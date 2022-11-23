@@ -98,25 +98,15 @@ def fillna(df):
     return df
 
 
-def interpolate_charttime_df(df, freq='1H', method='fillin', begin=None, end=None):
+def interpolate_charttime_df(df, freq='1H', method='fillin', begin=None, end=None, iids=None):
+    if iids == None:
+        iids = df['itemid'].unique()
+
     df_interp = pd.DataFrame(columns=['hadm_id', 'charttime', 'itemid', 'valuenum'])
     for adm in df['hadm_id'].unique():
-        for iid in df['itemid'].unique():
+        for iid in iids:
             df_ = pd.DataFrame(columns=df_interp.columns)
             data = df[(df['hadm_id']==adm) & (df['itemid']==iid)]
-
-            # x_dt = data['charttime'].values
-            # x = get_unixtime(x_dt)
-            # y = data['valuenum'].values
-            #
-            # f_interp = interp1d(x, y, kind='previous', fill_value=np.nan, bounds_error=False)
-            #
-            # start = pd.to_datetime(x_dt[0])
-            # delta_h = pd.Timedelta(hours=start.minute//30)
-            # start = start.replace(hour=start.hour, minute=0, second=0, microsecond=0) + delta_h
-            # x_dt_ = np.array(pd.date_range(start, x_dt[-1], freq=freq).to_pydatetime(), dtype=np.datetime64)
-            # x_ = get_unixtime(x_dt_)
-            # y_ = f_interp(x_)
 
             x_dt_, y_ = interpolate_charttime_data(data, freq, method=method, begin=begin, end=end)
 
@@ -125,8 +115,6 @@ def interpolate_charttime_df(df, freq='1H', method='fillin', begin=None, end=Non
             df_['hadm_id'] = adm
             df_['itemid'] = iid
 
-            # df_['valuenum'] = df_['valuenum'].fillna(method='ffill')
-            # df_['valuenum'] = df_['valuenum'].fillna(method='bfill')
             df_interp = pd.concat((df_interp, df_), ignore_index=True)
             df_interp['charttime'] = pd.to_datetime(df_interp['charttime'])
 
