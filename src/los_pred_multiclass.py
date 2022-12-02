@@ -36,6 +36,8 @@ from torch.profiler import profile, record_function, ProfilerActivity
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
+from ray import air, tune
+from ray.tune.integration.pytorch_lightning import TuneReportCallback
 
 TIMESERIES_LEN = 48
 ENCODE_DIM = 6
@@ -51,12 +53,19 @@ class PatientDatasetRaw(Dataset):
     def __getitem__(self, idx):
         df_sample = self.data[idx]
 
-        x_label = torch.tensor([df_sample['LOS'].iloc[-1]], dtype=torch.long)
-        mortality = df_sample['mortality']
-        if x_label > PRED_LOS * 24:
-            x_label = torch.Tensor([1])
+        mortality = df_sample['mortality'].iloc[-1]
+        x_label = np.array([df_sample['LOS'].iloc[-1]])
+        if mortality == 1:
+            x_label = torch.Tensor([4])
         else:
-            x_label = torch.Tensor([0])
+            if x_label < 5*24:
+                x_label = torch.Tensor([0])
+            elif (x_label >= 5*24) and (x_label < 10*24):
+                x_label = torch.Tensor([1])
+            elif (x_label >= 10*24) and (x_label < 20*24):
+                x_label = torch.Tensor([2])
+            else:
+                x_label = torch.Tensor([3])
 
         x_info = torch.tensor([df_sample[col].iloc[0] for col in col_info_numeric], dtype=torch.float)
         for col in col_info_text:
@@ -94,19 +103,25 @@ class PatientDatasetEncoded(Dataset):
     def __getitem__(self, idx):
         df_sample = self.data[idx].astype(float)
 
+        mortality = df_sample['mortality'].iloc[-1]
         x_label = np.array([df_sample['LOS'].iloc[-1]])
-        if x_label > PRED_LOS * 24:
-            x_label = torch.Tensor([1])
+        if mortality == 1:
+            x_label = torch.Tensor([4])
         else:
-            x_label = torch.Tensor([0])
-
+            if x_label < 5*24:
+                x_label = torch.Tensor([0])
+            elif (x_label >= 5*24) and (x_label < 10*24):
+                x_label = torch.Tensor([1])
+            elif (x_label >= 10*24) and (x_label < 20*24):
+                x_label = torch.Tensor([2])
+            else:
+                x_label = torch.Tensor([3])
 
         x_info = torch.tensor([df_sample[col].iloc[0] for col in col_info_numeric], dtype=torch.float)
         for col in col_info_text:
             ohk = F.one_hot(torch.tensor(df_sample[col].iloc[0].astype(int)), num_classes=len(info_text_vals[col]))
             x_info = torch.cat((x_info, ohk), dim=0)
 
-        # x_data = df_sample[col_numeric_encoded]
         x_data = torch.empty(TIMESERIES_LEN, 0)
         for col in col_chart_numeric:
             col_encoded = [col+'_'+elem for elem in ENCODE_ELEM]
@@ -146,22 +161,6 @@ class CNN_CLF(LightningModule):
         self.config = config
         self.data = data
 
-        # if data_type == 'raw':
-        #     self.cnn_layer1 = nn.Conv1d(
-        #         in_channels=config['cnn_in_channels'][0],
-        #         out_channels=config['cnn_out_channels'][0],
-        #         kernel_size=config['cnn_kernel_size'][0],
-        #         stride=config['cnn_stride_size'][0],
-        #         groups=config['cnn_group_size'][0],
-        #     )
-        # elif data_type == 'encoded':
-        #     self.cnn_layer1 = nn.Conv2d(
-        #         in_channels=config['cnn_in_channels'][0],
-        #         out_channels=config['cnn_out_channels'][0],
-        #         kernel_size=config['cnn_kernel_size'][0],
-        #         stride=config['cnn_stride_size'][0],
-        #         groups=config['cnn_group_size'][0],
-        #     )
         self.cnn_layer1 = nn.Conv1d(
             in_channels=config['cnn_in_channels'][0],
             out_channels=config['cnn_out_channels'][0],
@@ -187,26 +186,20 @@ class CNN_CLF(LightningModule):
 
         self.fc1 = nn.LazyLinear(out_features=256).cuda(device)
         self.fc2 = nn.LazyLinear(out_features=64).cuda(device)
-        self.fc3 = nn.LazyLinear(out_features=1).cuda(device)
+        self.fc3 = nn.LazyLinear(out_features=5).cuda(device)
 
-        self.loss = nn.BCEWithLogitsLoss().cuda(device)
+        self.loss = nn.CrossEntropyLoss().cuda(device)
 
         self.METRICS = {
-            'acc': torchmetrics.Accuracy().cpu(),
-            'recall': torchmetrics.Recall().cpu(),
-            'precision': torchmetrics.Precision().cpu(),
-            'specification': torchmetrics.Specificity().cpu(),
-            'roc': torchmetrics.AUROC(pos_label=1).cpu(),
-            # 'prc': torchmetrics.PrecisionRecallCurve(pos_label=1).cuda(device),
+            'acc_micro': torchmetrics.Accuracy(multiclass=True, average='micro', num_classes=5).cpu(),
+            'acc': torchmetrics.Accuracy(multiclass=True, average='macro', num_classes=5).cpu(),
+            'recall': torchmetrics.Recall(multiclass=True, average='macro', num_classes=5).cpu(),
+            'precision': torchmetrics.Precision(multiclass=True, average='macro', num_classes=5).cpu(),
+            'specification': torchmetrics.Specificity(multiclass=True, average='macro', num_classes=5).cpu(),
+            'roc': torchmetrics.AUROC(num_classes=5).cpu(),
+            # 'prc': torchmetrics.PrecisionRecallCurve(pos_label=1).cpu(),
             # 'prc': precision_recall_curve,
-            'f1': torchmetrics.F1().cpu(),
-            # 'acc': torchmetrics.Accuracy().cuda(device),
-            # 'recall': torchmetrics.Recall().cuda(device),
-            # 'precision': torchmetrics.Precision().cuda(device),
-            # 'roc': torchmetrics.AUROC(pos_label=1).cuda(device),
-            # # 'prc': torchmetrics.PrecisionRecallCurve(pos_label=1).cuda(device),
-            # # 'prc': precision_recall_curve,
-            # 'f1': torchmetrics.F1().cuda(device),
+            'f1': torchmetrics.F1(multiclass=True, average='macro', num_classes=5).cpu(),
         }
 
     def forward(self, x):
@@ -236,10 +229,10 @@ class CNN_CLF(LightningModule):
 
         x = F.dropout(F.relu(self.fc1(x)), p=self.config['dropout'])
         x = F.dropout(F.relu(self.fc2(x)), p=self.config['dropout'])
-        x = self.fc3(x)
-        output = F.sigmoid(x)
+        logit = self.fc3(x)
+        prob = F.softmax(logit)
 
-        return x, output
+        return logit, prob
 
 
     def configure_optimizers(self):
@@ -259,9 +252,9 @@ class CNN_CLF(LightningModule):
         # lr_sch = self.lr_schedulers()
         # lr_sch.step()
         x = batch['data']
-        y = batch['label']
+        y = batch['label'].squeeze()
         x_logit, pred = self.forward(x)
-        loss = self.loss(x_logit, y)
+        loss = self.loss(x_logit, y.long())
 
         torch.cuda.empty_cache()
 
@@ -273,7 +266,7 @@ class CNN_CLF(LightningModule):
             #     auprc = auc(recall, precision)
             #     outputs["train_"+metric] = auprc
             # else:
-            outputs["train_"+metric] = self.METRICS[metric](pred.detach().cpu(), y.int().detach().cpu())
+            outputs["train_"+metric] = self.METRICS[metric](pred.detach().cpu(), y.long().detach().cpu())
             self.log("train_" + metric, outputs["train_"+metric], on_step=False, on_epoch=True, prog_bar=True,
                      logger=True)
 
@@ -283,10 +276,10 @@ class CNN_CLF(LightningModule):
         # with profile(activities=[ ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
         #     with record_function("model_inference"):
         x = batch['data']
-        y = batch['label']
+        y = batch['label'].squeeze()
         # print(x['static'].device)
         x_logit, pred = self.forward(x)
-        loss = self.loss(x_logit, y)
+        loss = self.loss(x_logit, y.long())
 
         torch.cuda.empty_cache()
 
@@ -298,7 +291,7 @@ class CNN_CLF(LightningModule):
             #     auprc = auc(recall, precision)
             #     outputs["val_"+metric] = auprc
             # else:
-            outputs["val_"+metric] = self.METRICS[metric](pred.detach().cpu(), y.int().detach().cpu())
+            outputs["val_"+metric] = self.METRICS[metric](pred.detach().cpu(), y.long().detach().cpu())
             self.log("val_"+metric, outputs["val_"+metric], on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         # print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
@@ -306,9 +299,9 @@ class CNN_CLF(LightningModule):
 
     def test_step(self, batch, batch_idx):
         x = batch['data']
-        y = batch['label']
+        y = batch['label'].squeeze()
         x_logit, pred = self.forward(x)
-        loss = self.loss(x_logit, y)
+        loss = self.loss(x_logit, y.long())
 
         torch.cuda.empty_cache()
 
@@ -320,7 +313,7 @@ class CNN_CLF(LightningModule):
             #     auprc = auc(recall, precision)
             #     outputs["test_"+metric] = auprc
             # else:
-            outputs["test_" + metric] = self.METRICS[metric](pred.detach().cpu(), y.int().detach().cpu())
+            outputs["test_" + metric] = self.METRICS[metric](pred.detach().cpu(), y.long().detach().cpu())
             self.log("test_" + metric, outputs["test_" + metric], on_step=False, on_epoch=True, prog_bar=True,
                      logger=True)
         return outputs
@@ -369,18 +362,11 @@ if __name__ == '__main__':
         type=int,
         default=[999],
     )
-    CLI.add_argument(
-        "--los",
-        nargs="*",
-        type=int,
-        default=[3],
-    )
     args = CLI.parse_args()
 
     data_type = args.datatype[0]
     device = args.gpu[0]
     seed = args.seed[0]
-    PRED_LOS = args.los[0]
 
     torch.manual_seed(seed)
 
@@ -410,8 +396,8 @@ if __name__ == '__main__':
     # pickle.dump(training_data_encoded_zero_imp, open('/home/kai/workspace/data/mimic/training_data_encoded_0imp.pkl', 'wb'))
 
 
-    data_file_raw = '/home/kai/workspace/data/mimic/training_data_raw_0imp_without_mortality.pkl'
-    data_file_encoded = '/home/kai/workspace/data/mimic/training_data_encoded_0imp_without_mortality.pkl'
+    data_file_raw = '/home/kai/workspace/data/mimic/training_data_raw_0imp_with_mortality.pkl'
+    data_file_encoded = '/home/kai/workspace/data/mimic/training_data_encoded_0imp_with_mortality.pkl'
     data_folder = os.path.abspath('../data_all/')
 
     print(type(data_type), data_type, type(device), device)
@@ -448,11 +434,11 @@ if __name__ == '__main__':
         "avgpool_kernel_size": avgpool_kernel_size,
         "avgpool_stride_size": avgpool_stride_size,
         "dropout": .5,
-        "lr": 1e-5,
+        "lr": 1e-4,
         "batch_size": 64,
     }
 
-    model_name = f"{data_type}" + f"_2layer_{PRED_LOS}day"
+    model_name = f"{data_type}" + f"_2layer_multiclass"
     model_folder = f'../models/CNN_LOS_PRED/{model_name}'
     Path(model_folder).mkdir(parents=True, exist_ok=True)
 
@@ -508,7 +494,7 @@ if __name__ == '__main__':
             EarlyStopping(
                 monitor='val_loss',
                 mode='min',
-                patience=50,
+                patience=30,
             )
         ]
 
